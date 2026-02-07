@@ -40,7 +40,6 @@ class BarPropertySolver:
         self.bar_min_thickness = tk.StringVar(value="2.0")
         self.bar_max_thickness = tk.StringVar(value="12.0")
         self.thickness_step = tk.StringVar(value="0.5")
-        self.bar_skin_search_distance = tk.StringVar(value="150.0")
 
         # Data storage
         self.bdf_model = None
@@ -52,6 +51,7 @@ class BarPropertySolver:
         self.pbarl_dims = {}              # PID -> {'dim1': val, 'dim2': val} from BDF
         self.current_bar_thicknesses = {} # PID -> thickness
         self.current_skin_thicknesses = {}# PID -> thickness
+        self.original_bar_thicknesses = {} # PID -> original dim1 from BDF
         self.material_densities = {}      # MID -> density
         self.prop_to_material = {}        # PID -> MID
         self.element_areas = {}
@@ -162,8 +162,6 @@ class BarPropertySolver:
         row2.pack(fill=tk.X, pady=2)
         ttk.Label(row2, text="Step:").pack(side=tk.LEFT)
         ttk.Entry(row2, textvariable=self.thickness_step, width=8).pack(side=tk.LEFT, padx=5)
-        ttk.Label(row2, text="Bar-Skin Distance (mm):").pack(side=tk.LEFT, padx=(20, 0))
-        ttk.Entry(row2, textvariable=self.bar_skin_search_distance, width=8).pack(side=tk.LEFT, padx=5)
 
         # ---- Section 3: Actions ----
         f3 = ttk.LabelFrame(main, text="3. Actions", padding=10)
@@ -337,9 +335,12 @@ class BarPropertySolver:
                     elif len(dims) == 1:
                         self.pbarl_dims[pid] = {'dim1': dims[0], 'dim2': dims[0]}
 
+            # Store original dim1 from BDF as the original thicknesses
+            self.original_bar_thicknesses = {}
             if self.pbarl_dims:
                 self.log(f"  PBARL dimensions extracted: {len(self.pbarl_dims)} properties")
                 for pid, d in self.pbarl_dims.items():
+                    self.original_bar_thicknesses[pid] = d['dim1']
                     self.log(f"    PID {pid}: dim1={d['dim1']}, dim2={d['dim2']}")
 
             self.log(f"  Shells: {shell_count}, Bars: {bar_count}")
@@ -421,11 +422,16 @@ class BarPropertySolver:
                         pid = int(pid_val)
                         struct_name = str(row[struct_col]).strip() if struct_col and pd.notna(row[struct_col]) else "DEFAULT"
 
+                        # Use original BDF dim1 if available, otherwise bar_min
+                        orig_dim1 = self.original_bar_thicknesses.get(pid, bar_min)
+                        orig_dim2 = self.pbarl_dims[pid]['dim2'] if pid in self.pbarl_dims else bar_min
+
                         self.bar_properties[pid] = {
-                            'dim1': bar_min,
-                            'dim2': bar_min,
+                            'dim1': orig_dim1,
+                            'dim2': orig_dim2,
                         }
-                        self.current_bar_thicknesses[pid] = bar_min
+                        # Initialize to original BDF value (not bar_min)
+                        self.current_bar_thicknesses[pid] = orig_dim1
                         self.bar_structure_map[pid] = struct_name
 
                         if struct_name not in self.structure_groups:
@@ -436,6 +442,11 @@ class BarPropertySolver:
                     self.log(f"  Structure groups: {len(self.structure_groups)}")
                     for name, pids in sorted(self.structure_groups.items()):
                         self.log(f"    {name}: {len(pids)} properties")
+
+                    # Log original thickness info
+                    bdf_count = sum(1 for pid in self.bar_properties if pid in self.original_bar_thicknesses)
+                    self.log(f"  Properties with BDF original dim1: {bdf_count}/{len(self.bar_properties)}")
+                    self.log(f"  NOTE: Only active group thicknesses will change during sweep.")
 
                 elif 'skin' in sl and 'prop' in sl:
                     self.log(f"\n  Reading skin properties from '{sheet}'...")
@@ -1123,6 +1134,7 @@ class BarPropertySolver:
                 self.log(f"\n{'=' * 70}")
                 self.log(f"STRUCTURE GROUP: {struct_name} ({group_idx + 1}/{total_groups})")
                 self.log(f"  Properties: {len(pids)} -> {sorted(pids)[:20]}{'...' if len(pids) > 20 else ''}")
+                self.log(f"  Only {struct_name} thicknesses will change. All other groups keep original BDF values.")
                 self.log(f"{'=' * 70}")
 
                 # Create folder for this structure
@@ -1177,9 +1189,9 @@ class BarPropertySolver:
                 # Save group summary
                 self._save_group_summary(group_folder, struct_name, group_results, pids)
 
-                # Reset thicknesses for this group back to min
+                # Reset thicknesses for this group back to original BDF values
                 for pid in pids:
-                    self.current_bar_thicknesses[pid] = bar_min
+                    self.current_bar_thicknesses[pid] = self.original_bar_thicknesses.get(pid, bar_min)
 
             # Save overall summary
             if self.is_running:
@@ -1353,7 +1365,6 @@ class BarPropertySolver:
                 f.write(f"Bar Min: {self.bar_min_thickness.get()} mm\n")
                 f.write(f"Bar Max: {self.bar_max_thickness.get()} mm\n")
                 f.write(f"Step: {self.thickness_step.get()} mm\n")
-                f.write(f"Bar-Skin Distance: {self.bar_skin_search_distance.get()} mm\n")
                 f.write(f"BDF Files: {len(self.bdf_paths)}\n")
                 for p in self.bdf_paths:
                     f.write(f"  {p}\n")
