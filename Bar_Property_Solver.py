@@ -889,9 +889,11 @@ class BarPropertySolver:
                                     'subcase': int(sc_id)
                                 })
 
+                                struct_name = self.bar_structure_map.get(pid, '') if pid else ''
                                 bar_stress_rows.append({
                                     'OP2': op2_name, 'Subcase': int(sc_id), 'Element': int(eid),
-                                    'Property': pid, 'Axial': float(axial) if axial else 0,
+                                    'Property': pid, 'Structure': struct_name,
+                                    'Axial': float(axial) if axial else 0,
                                     'Dim1': d1, 'Dim2': d2, 'Area': area,
                                     'Stress': float(stress) if stress else None
                                 })
@@ -933,7 +935,7 @@ class BarPropertySolver:
             csv_path = os.path.join(folder, 'bar_stress_results.csv')
             with open(csv_path, 'w', newline='') as f:
                 w = csv.DictWriter(f, fieldnames=[
-                    'OP2', 'Subcase', 'Element', 'Property', 'Axial', 'Dim1', 'Dim2', 'Area', 'Stress'
+                    'OP2', 'Subcase', 'Element', 'Property', 'Structure', 'Axial', 'Dim1', 'Dim2', 'Area', 'Stress'
                 ])
                 w.writeheader()
                 w.writerows(bar_stress_rows)
@@ -1004,8 +1006,11 @@ class BarPropertySolver:
                                 components.append(f"{case_id}*{multiplier}")
 
                     if components:
+                        pid = self.elem_to_prop.get(int(eid))
+                        struct_name = self.bar_structure_map.get(pid, '') if pid else ''
                         results.append({
                             'Combined_LC': comb_lc, 'Element': int(eid),
+                            'Property': pid, 'Structure': struct_name,
                             'Combined_Stress': total_stress,
                             'Components': ' + '.join(components)
                         })
@@ -1013,7 +1018,7 @@ class BarPropertySolver:
             if results:
                 comb_csv = os.path.join(folder, 'combined_stress_results.csv')
                 with open(comb_csv, 'w', newline='') as f:
-                    w = csv.DictWriter(f, fieldnames=['Combined_LC', 'Element', 'Combined_Stress', 'Components'])
+                    w = csv.DictWriter(f, fieldnames=['Combined_LC', 'Element', 'Property', 'Structure', 'Combined_Stress', 'Components'])
                     w.writeheader()
                     w.writerows(results)
                 self.log(f"    Combined stress CSV saved ({len(results)} rows)")
