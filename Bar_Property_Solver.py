@@ -20,6 +20,7 @@ from pyNastran.op2.op2 import OP2
 import numpy as np
 import subprocess
 from datetime import datetime
+from scipy.optimize import curve_fit
 
 
 class BarPropertySolver:
@@ -1184,8 +1185,8 @@ class BarPropertySolver:
 
                     # Log summary for this thickness
                     if group_stress_data:
-                        max_stress = max(abs(s['stress']) for s in group_stress_data) if group_stress_data else 0
-                        avg_stress = np.mean([abs(s['stress']) for s in group_stress_data]) if group_stress_data else 0
+                        max_stress = max(s['stress'] for s in group_stress_data) if group_stress_data else 0
+                        avg_stress = np.mean([s['stress'] for s in group_stress_data]) if group_stress_data else 0
                         self.log(f"    Max stress: {max_stress:.2f}, Avg stress: {avg_stress:.2f}")
                         self.log(f"    Elements in group: {len(group_stress_data)}")
 
@@ -1224,7 +1225,7 @@ class BarPropertySolver:
         group_pid_set = set(group_pids)
         result = []
 
-        # Build combined stress lookup (max per element)
+        # Build combined stress lookup (max positive stress per element)
         combined_lookup = {}
         if combined_stresses:
             for cs in combined_stresses:
@@ -1232,7 +1233,7 @@ class BarPropertySolver:
                 pid = self.elem_to_prop.get(eid)
                 if pid and pid in group_pid_set:
                     comb_stress = cs['Combined_Stress']
-                    if eid not in combined_lookup or abs(comb_stress) > abs(combined_lookup[eid]):
+                    if eid not in combined_lookup or comb_stress > combined_lookup[eid]:
                         combined_lookup[eid] = comb_stress
 
         # Prefer combined stress; fall back to raw stress
@@ -1279,22 +1280,22 @@ class BarPropertySolver:
             for gr in group_results:
                 row = {'Thickness_mm': gr['thickness']}
 
-                # Per-PID max stress
+                # Per-PID max positive stress
                 pid_stresses = {}
                 for s in gr['stresses']:
                     pid = s['pid']
-                    stress_val = abs(s['stress'])
+                    stress_val = s['stress']
                     if pid not in pid_stresses or stress_val > pid_stresses[pid]:
                         pid_stresses[pid] = stress_val
 
                 for pid in sorted_pids:
                     row[f'PID_{pid}_Stress'] = pid_stresses.get(pid, '')
 
-                # Aggregates
-                all_stress_vals = [abs(s['stress']) for s in gr['stresses']] if gr['stresses'] else []
-                row['Max_Combined_Stress'] = max(all_stress_vals) if all_stress_vals else ''
-                row['Avg_Combined_Stress'] = np.mean(all_stress_vals) if all_stress_vals else ''
-                row['Min_Combined_Stress'] = min(all_stress_vals) if all_stress_vals else ''
+                # Aggregates (max positive)
+                all_stress_vals = [s['stress'] for s in gr['stresses']] if gr['stresses'] else []
+                row['Max_Stress'] = max(all_stress_vals) if all_stress_vals else ''
+                row['Avg_Stress'] = np.mean(all_stress_vals) if all_stress_vals else ''
+                row['Min_Stress'] = min(all_stress_vals) if all_stress_vals else ''
                 row['Element_Count'] = len(gr['stresses'])
 
                 summary_rows.append(row)
@@ -1303,14 +1304,14 @@ class BarPropertySolver:
                 # Build column order
                 columns = ['Thickness_mm']
                 columns += [f'PID_{pid}_Stress' for pid in sorted_pids]
-                columns += ['Max_Combined_Stress', 'Avg_Combined_Stress', 'Min_Combined_Stress', 'Element_Count']
+                columns += ['Max_Stress', 'Avg_Stress', 'Min_Stress', 'Element_Count']
 
                 df = pd.DataFrame(summary_rows, columns=columns)
                 csv_path = os.path.join(group_folder, f"{struct_name}_summary.csv")
                 df.to_csv(csv_path, index=False)
                 self.log(f"\n  Summary saved: {csv_path}")
 
-                # Also save element-level detail
+                # Also save element-level detail (max positive stress, not abs)
                 detail_rows = []
                 for gr in group_results:
                     for s in gr['stresses']:
@@ -1319,7 +1320,6 @@ class BarPropertySolver:
                             'Element_ID': s['eid'],
                             'Property_ID': s['pid'],
                             'Stress': s['stress'],
-                            'Abs_Stress': abs(s['stress']),
                             'Source': s['source'],
                         })
 
@@ -1329,8 +1329,111 @@ class BarPropertySolver:
                     detail_df.to_csv(detail_csv, index=False)
                     self.log(f"  Detail saved: {detail_csv}")
 
+                # Power law fit per element: stress = a * thickness^b
+                self._save_powerlaw_fit(group_folder, struct_name, group_results)
+
         except Exception as e:
             self.log(f"  Summary save error: {e}")
+
+    def _save_powerlaw_fit(self, group_folder, struct_name, group_results):
+        """Fit power law (stress = a * thickness^b) per element and save summary."""
+        try:
+            # Build per-element data: eid -> [(thickness, stress), ...]
+            elem_data = {}
+            elem_pid = {}
+            for gr in group_results:
+                t = gr['thickness']
+                for s in gr['stresses']:
+                    eid = s['eid']
+                    if eid not in elem_data:
+                        elem_data[eid] = []
+                        elem_pid[eid] = s['pid']
+                    elem_data[eid].append((t, s['stress']))
+
+            if not elem_data:
+                return
+
+            def power_law(x, a, b):
+                return a * np.power(x, b)
+
+            fit_rows = []
+            for eid in sorted(elem_data.keys()):
+                points = elem_data[eid]
+                pid = elem_pid[eid]
+
+                t_arr = np.array([p[0] for p in points])
+                s_arr = np.array([p[1] for p in points])
+
+                # Need at least 2 positive points for power law fit
+                valid = (t_arr > 0) & (s_arr > 0)
+                t_valid = t_arr[valid]
+                s_valid = s_arr[valid]
+
+                if len(t_valid) < 2:
+                    fit_rows.append({
+                        'Element_ID': eid,
+                        'Property_ID': pid,
+                        'Structure': struct_name,
+                        'a': '',
+                        'b': '',
+                        'R2': '',
+                        'N_Points': len(t_valid),
+                        'Status': 'insufficient_data',
+                    })
+                    continue
+
+                try:
+                    # Log-space linear regression for power law: log(s) = log(a) + b*log(t)
+                    log_t = np.log(t_valid)
+                    log_s = np.log(s_valid)
+                    coeffs = np.polyfit(log_t, log_s, 1)
+                    b_val = coeffs[0]
+                    a_val = np.exp(coeffs[1])
+
+                    # R^2 calculation
+                    s_pred = a_val * np.power(t_valid, b_val)
+                    ss_res = np.sum((s_valid - s_pred) ** 2)
+                    ss_tot = np.sum((s_valid - np.mean(s_valid)) ** 2)
+                    r2 = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
+
+                    fit_rows.append({
+                        'Element_ID': eid,
+                        'Property_ID': pid,
+                        'Structure': struct_name,
+                        'a': round(a_val, 4),
+                        'b': round(b_val, 4),
+                        'R2': round(r2, 6),
+                        'N_Points': len(t_valid),
+                        'Status': 'ok',
+                    })
+                except Exception:
+                    fit_rows.append({
+                        'Element_ID': eid,
+                        'Property_ID': pid,
+                        'Structure': struct_name,
+                        'a': '',
+                        'b': '',
+                        'R2': '',
+                        'N_Points': len(t_valid),
+                        'Status': 'fit_failed',
+                    })
+
+            if fit_rows:
+                fit_df = pd.DataFrame(fit_rows)
+                fit_csv = os.path.join(group_folder, f"{struct_name}_powerlaw_fit.csv")
+                fit_df.to_csv(fit_csv, index=False)
+                self.log(f"  Power law fit saved: {fit_csv}")
+
+                # Log summary stats
+                ok_fits = [r for r in fit_rows if r['Status'] == 'ok']
+                if ok_fits:
+                    r2_vals = [r['R2'] for r in ok_fits]
+                    self.log(f"    Fitted {len(ok_fits)}/{len(fit_rows)} elements")
+                    self.log(f"    R2 range: {min(r2_vals):.4f} - {max(r2_vals):.4f}")
+                    self.log(f"    R2 mean:  {np.mean(r2_vals):.4f}")
+
+        except Exception as e:
+            self.log(f"  Power law fit error: {e}")
 
     def _save_overall_summary(self, run_folder):
         """Save overall summary across all structure groups."""
@@ -1342,7 +1445,7 @@ class BarPropertySolver:
             overall_rows = []
             for struct_name, results in sorted(self.sweep_results.items()):
                 for gr in results:
-                    all_stress_vals = [abs(s['stress']) for s in gr['stresses']] if gr['stresses'] else []
+                    all_stress_vals = [s['stress'] for s in gr['stresses']] if gr['stresses'] else []
                     overall_rows.append({
                         'Structure': struct_name,
                         'Thickness_mm': gr['thickness'],
