@@ -1332,6 +1332,9 @@ class BarPropertySolver:
                 # Power law fit per element: stress = a * thickness^b
                 self._save_powerlaw_fit(group_folder, struct_name, group_results)
 
+                # Element-based load/strain driven summary
+                self._save_load_strain_summary(group_folder, struct_name, group_results)
+
         except Exception as e:
             self.log(f"  Summary save error: {e}")
 
@@ -1434,6 +1437,136 @@ class BarPropertySolver:
 
         except Exception as e:
             self.log(f"  Power law fit error: {e}")
+
+    def _save_load_strain_summary(self, group_folder, struct_name, group_results):
+        """Element-based load/strain driven summary.
+        Compares stress at min vs max thickness for each element.
+        If stress drops significantly with thickness increase -> LOAD driven (stress ~ 1/A)
+        If stress stays similar despite thickness increase -> STRAIN driven (stress ~ geometry)
+        """
+        try:
+            if len(group_results) < 2:
+                return
+
+            t_min = group_results[0]['thickness']
+            t_max = group_results[-1]['thickness']
+
+            # Build stress at min and max thickness per element
+            stress_at_min = {}  # eid -> stress
+            stress_at_max = {}  # eid -> stress
+            elem_pid_map = {}
+
+            for s in group_results[0]['stresses']:
+                stress_at_min[s['eid']] = s['stress']
+                elem_pid_map[s['eid']] = s['pid']
+
+            for s in group_results[-1]['stresses']:
+                stress_at_max[s['eid']] = s['stress']
+                if s['eid'] not in elem_pid_map:
+                    elem_pid_map[s['eid']] = s['pid']
+
+            # Also get power law fit data for each element
+            elem_fit = {}
+            elem_data = {}
+            for gr in group_results:
+                t = gr['thickness']
+                for s in gr['stresses']:
+                    eid = s['eid']
+                    if eid not in elem_data:
+                        elem_data[eid] = []
+                    elem_data[eid].append((t, s['stress']))
+
+            for eid, points in elem_data.items():
+                t_arr = np.array([p[0] for p in points])
+                s_arr = np.array([p[1] for p in points])
+                valid = (t_arr > 0) & (s_arr > 0)
+                t_v = t_arr[valid]
+                s_v = s_arr[valid]
+                if len(t_v) >= 2:
+                    try:
+                        log_t = np.log(t_v)
+                        log_s = np.log(s_v)
+                        coeffs = np.polyfit(log_t, log_s, 1)
+                        b_val = coeffs[0]
+                        a_val = np.exp(coeffs[1])
+                        s_pred = a_val * np.power(t_v, b_val)
+                        ss_res = np.sum((s_v - s_pred) ** 2)
+                        ss_tot = np.sum((s_v - np.mean(s_v)) ** 2)
+                        r2 = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
+                        elem_fit[eid] = {'a': a_val, 'b': b_val, 'r2': r2}
+                    except:
+                        pass
+
+            all_eids = sorted(set(stress_at_min.keys()) | set(stress_at_max.keys()))
+
+            rows = []
+            for eid in all_eids:
+                pid = elem_pid_map.get(eid, '')
+                s_min_t = stress_at_min.get(eid)
+                s_max_t = stress_at_max.get(eid)
+
+                if s_min_t is None or s_max_t is None:
+                    continue
+
+                stress_diff = s_min_t - s_max_t
+                stress_pct = (stress_diff / s_min_t * 100) if s_min_t != 0 else 0
+                thickness_ratio = t_max / t_min if t_min > 0 else 0
+
+                # Classification based on power law exponent b
+                # b ~ -1: pure load driven (stress = F/A, inversely proportional)
+                # b ~ 0: strain driven (stress doesn't change much with thickness)
+                fit = elem_fit.get(eid)
+                if fit:
+                    b_val = fit['b']
+                    a_val = fit['a']
+                    r2 = fit['r2']
+                    if b_val <= -0.5:
+                        classification = 'LOAD_DRIVEN'
+                    elif b_val <= -0.1:
+                        classification = 'PARTIALLY_LOAD'
+                    elif b_val <= 0.1:
+                        classification = 'STRAIN_DRIVEN'
+                    else:
+                        classification = 'INCREASING'
+                else:
+                    a_val = ''
+                    b_val = ''
+                    r2 = ''
+                    classification = 'NO_FIT'
+
+                rows.append({
+                    'Element_ID': eid,
+                    'Property_ID': pid,
+                    'Structure': struct_name,
+                    'T_Min_mm': t_min,
+                    'Stress_at_T_Min': round(s_min_t, 4),
+                    'T_Max_mm': t_max,
+                    'Stress_at_T_Max': round(s_max_t, 4),
+                    'Stress_Drop': round(stress_diff, 4),
+                    'Stress_Drop_Pct': round(stress_pct, 2),
+                    'Thickness_Ratio': round(thickness_ratio, 4),
+                    'Power_a': round(a_val, 4) if isinstance(a_val, float) else '',
+                    'Power_b': round(b_val, 4) if isinstance(b_val, float) else '',
+                    'R2': round(r2, 6) if isinstance(r2, float) else '',
+                    'Classification': classification,
+                })
+
+            if rows:
+                df = pd.DataFrame(rows)
+                csv_path = os.path.join(group_folder, f"{struct_name}_load_strain_summary.csv")
+                df.to_csv(csv_path, index=False)
+                self.log(f"  Load/Strain summary saved: {csv_path}")
+
+                # Log classification counts
+                cls_counts = {}
+                for r in rows:
+                    c = r['Classification']
+                    cls_counts[c] = cls_counts.get(c, 0) + 1
+                for c, cnt in sorted(cls_counts.items()):
+                    self.log(f"    {c}: {cnt} elements")
+
+        except Exception as e:
+            self.log(f"  Load/Strain summary error: {e}")
 
     def _save_overall_summary(self, run_folder):
         """Save overall summary across all structure groups."""
